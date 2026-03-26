@@ -1,0 +1,275 @@
+WITH
+/*============================================================
+0) Weights (optional but recommended)
+============================================================*/
+weights_final AS (
+  SELECT
+    user_id,
+    CAST(COALESCE(projected_weight, weight, 1.0) AS FLOAT64) AS w
+  FROM `firebird-data-project.nielseniq.weights`
+),
+
+/*============================================================
+1) Canonicalize items_extended across extracts
+============================================================*/
+items_extended_canon AS (
+  SELECT * EXCEPT(rn)
+  FROM (
+    SELECT
+      e.*,
+      ROW_NUMBER() OVER (
+        PARTITION BY e.order_id, e.item_id
+        ORDER BY e.extract_id DESC
+      ) AS rn
+    FROM `firebird-data-project.nielseniq.items_extended` e
+  )
+  WHERE rn = 1
+),
+
+/*============================================================
+2) Cohort: Zach Top ticket purchasers
+============================================================*/
+zt_ticket_users AS (
+  SELECT DISTINCT
+    e.user_id
+  FROM `firebird-data-project.nielseniq.items_tickets_parsed` t
+  JOIN items_extended_canon e
+    ON t.order_id = e.order_id
+   AND t.item_id  = e.item_id
+  WHERE
+    e.user_id IS NOT NULL
+    AND REGEXP_CONTAINS(LOWER(t.event_name), r'\bzach top\b')
+),
+
+/*============================================================
+3) Population universe: all purchasers (split into cohort vs non)
+============================================================*/
+population_users AS (
+  SELECT DISTINCT user_id
+  FROM items_extended_canon
+  WHERE user_id IS NOT NULL
+),
+
+/*============================================================
+5) Item lines with description + dollars
+============================================================*/
+item_lines AS (
+  SELECT
+    e.user_id,
+    e.order_id,
+    e.item_id,
+    i.description,
+    LOWER(i.description) AS desc_l,
+    CAST(
+      CASE
+        WHEN e.item_price IS NOT NULL THEN e.item_quantity * e.item_price
+        ELSE e.order_total
+      END AS FLOAT64
+    ) AS dollars
+  FROM items_extended_canon e
+  JOIN `firebird-data-project.nielseniq.items` i
+    ON e.order_id = i.order_id
+   AND e.item_id  = i.item_id
+  WHERE e.user_id IS NOT NULL
+),
+
+/*============================================================
+5b) Tagged lines (beer items but not merch)
+   - Your requested flags + beer/not-merch filter
+============================================================*/
+tagged_lines AS (
+  SELECT
+    il.user_id,
+    il.order_id,
+    il.item_id,
+    il.dollars,
+
+    /* Individual categories */
+    (
+      CONTAINS_SUBSTR(il.desc_l, 'coors banquet')
+      OR CONTAINS_SUBSTR(il.desc_l, 'coors original')
+      OR REGEXP_CONTAINS(il.desc_l, r'\bbanquet\b')
+    ) AS is_coors_banquet,
+
+  (
+  CONTAINS_SUBSTR(il.desc_l, 'coors light')
+  OR CONTAINS_SUBSTR(il.desc_l, 'coors banquet')
+  OR CONTAINS_SUBSTR(il.desc_l, 'coors original')
+  OR CONTAINS_SUBSTR(il.desc_l, 'miller lite')
+  OR CONTAINS_SUBSTR(il.desc_l, 'miller genuine draft')
+  OR CONTAINS_SUBSTR(il.desc_l, 'miller high life')
+  OR CONTAINS_SUBSTR(il.desc_l, 'blue moon')
+  OR CONTAINS_SUBSTR(il.desc_l, 'keystone light')
+  OR CONTAINS_SUBSTR(il.desc_l, 'keystone')
+  OR CONTAINS_SUBSTR(il.desc_l, 'leinenkugel')
+  OR CONTAINS_SUBSTR(il.desc_l, 'leinie')
+  OR CONTAINS_SUBSTR(il.desc_l, 'redds')
+  OR CONTAINS_SUBSTR(il.desc_l, "redd's")
+  OR CONTAINS_SUBSTR(il.desc_l, 'steel reserve')
+) AS is_molson_coors_overall,
+
+  
+    /* QA beer bucket */
+    REGEXP_CONTAINS(
+      il.desc_l,
+      r'\b(beer|lager|ipa|ale|stout|porter|pilsner|light\s*beer|draft|brew)\b'
+    ) AS is_beer_all
+
+  FROM item_lines il
+  WHERE
+    REGEXP_CONTAINS(
+      il.desc_l,
+      r'(?i)\b(beer|lager|ipa|ale|stout|porter|pilsner|draft|brew|can|bottle|keg)\b'
+    )
+    AND NOT REGEXP_CONTAINS(il.desc_l, r'\b(top|shirt|hat|fabric|candle|card|tray)\b')
+),
+
+/*============================================================
+6) Convert flags -> category rows
+============================================================*/
+matched_lines AS (
+  SELECT
+    tl.user_id,
+    tl.order_id,
+    tl.item_id,
+    tl.dollars,
+    c.category,
+    (zt.user_id IS NOT NULL) AS is_cohort
+  FROM tagged_lines tl
+  LEFT JOIN zt_ticket_users zt
+    ON tl.user_id = zt.user_id
+  CROSS JOIN UNNEST([
+    STRUCT('Coors Banquet'          AS category, tl.is_coors_banquet AS matched),
+    STRUCT('Molson Coors'            AS category, tl.is_molson_coors_overall   AS matched),
+    STRUCT('Beer (All)'             AS category, tl.is_beer_all      AS matched)
+  ]) c
+  WHERE c.matched
+),
+
+/*============================================================
+7) User-level flags + dollars per category
+============================================================*/
+user_category AS (
+  SELECT
+    user_id,
+    is_cohort,
+    category,
+    TRUE AS bought_category,
+    SUM(dollars) AS category_dollars
+  FROM matched_lines
+  GROUP BY user_id, is_cohort, category
+),
+
+/*============================================================
+8) Denominators (all purchasers), cohort vs non-cohort
+============================================================*/
+denoms AS (
+  SELECT
+    (zt.user_id IS NOT NULL) AS is_cohort,
+    COUNT(DISTINCT pu.user_id) AS users,
+    SUM(COALESCE(wf.w, 1.0))   AS users_w
+  FROM population_users pu
+  LEFT JOIN zt_ticket_users zt
+    ON pu.user_id = zt.user_id
+  LEFT JOIN weights_final wf
+    ON pu.user_id = wf.user_id
+  GROUP BY is_cohort
+),
+
+/*============================================================
+9) Numerators per category, cohort vs non-cohort
+============================================================*/
+agg AS (
+  SELECT
+    uc.category,
+    uc.is_cohort,
+
+    COUNT(DISTINCT uc.user_id) AS buyers,
+    SUM(uc.category_dollars)   AS dollars,
+
+    SUM(COALESCE(wf.w, 1.0))   AS buyers_w,
+    SUM(COALESCE(wf.w, 1.0) * uc.category_dollars) AS dollars_w
+  FROM user_category uc
+  LEFT JOIN weights_final wf
+    ON uc.user_id = wf.user_id
+  GROUP BY uc.category, uc.is_cohort
+),
+
+/*============================================================
+10) Pair cohort vs non-cohort on one row per category
+============================================================*/
+paired AS (
+  SELECT
+    a.category,
+
+    dc.users     AS cohort_users,
+    dn.users     AS noncohort_users,
+    dc.users_w   AS cohort_users_w,
+    dn.users_w   AS noncohort_users_w,
+
+    a.buyers     AS cohort_buyers,
+    b.buyers     AS noncohort_buyers,
+    a.dollars    AS cohort_dollars,
+    b.dollars    AS noncohort_dollars,
+
+    a.buyers_w   AS cohort_buyers_w,
+    b.buyers_w   AS noncohort_buyers_w,
+    a.dollars_w  AS cohort_dollars_w,
+    b.dollars_w  AS noncohort_dollars_w
+  FROM agg a
+  JOIN agg b
+    ON a.category = b.category
+   AND a.is_cohort = TRUE
+   AND b.is_cohort = FALSE
+  JOIN denoms dc
+    ON dc.is_cohort = TRUE
+  JOIN denoms dn
+    ON dn.is_cohort = FALSE
+)
+
+/*============================================================
+11) Final: penetration + index (+ spend per buyer + index)
+============================================================*/
+SELECT
+  category,
+
+  /* Bases */
+  cohort_users,
+  noncohort_users,
+  cohort_users_w,
+  noncohort_users_w,
+
+  /* Penetration (unweighted) */
+  SAFE_DIVIDE(cohort_buyers, cohort_users)       AS cohort_penetration,
+  SAFE_DIVIDE(noncohort_buyers, noncohort_users) AS noncohort_penetration,
+  SAFE_DIVIDE(
+    SAFE_DIVIDE(cohort_buyers, cohort_users),
+    SAFE_DIVIDE(noncohort_buyers, noncohort_users)
+  ) AS penetration_index,
+
+  /* Spend per buyer (unweighted) */
+  SAFE_DIVIDE(cohort_dollars, NULLIF(cohort_buyers, 0))         AS cohort_spend_per_buyer,
+  SAFE_DIVIDE(noncohort_dollars, NULLIF(noncohort_buyers, 0))   AS noncohort_spend_per_buyer,
+  SAFE_DIVIDE(
+    SAFE_DIVIDE(cohort_dollars, NULLIF(cohort_buyers, 0)),
+    SAFE_DIVIDE(noncohort_dollars, NULLIF(noncohort_buyers, 0))
+  ) AS spend_index,
+
+  /* Penetration (weighted) */
+  SAFE_DIVIDE(cohort_buyers_w, cohort_users_w)         AS cohort_penetration_w,
+  SAFE_DIVIDE(noncohort_buyers_w, noncohort_users_w)   AS noncohort_penetration_w,
+  SAFE_DIVIDE(
+    SAFE_DIVIDE(cohort_buyers_w, cohort_users_w),
+    SAFE_DIVIDE(noncohort_buyers_w, noncohort_users_w)
+  ) AS penetration_index_w,
+
+  /* Spend per buyer (weighted) */
+  SAFE_DIVIDE(cohort_dollars_w, NULLIF(cohort_buyers_w, 0))           AS cohort_spend_per_buyer_w,
+  SAFE_DIVIDE(noncohort_dollars_w, NULLIF(noncohort_buyers_w, 0))     AS noncohort_spend_per_buyer_w,
+  SAFE_DIVIDE(
+    SAFE_DIVIDE(cohort_dollars_w, NULLIF(cohort_buyers_w, 0)),
+    SAFE_DIVIDE(noncohort_dollars_w, NULLIF(noncohort_buyers_w, 0))
+  ) AS spend_index_w
+
+FROM paired
+ORDER BY penetration_index_w DESC;
