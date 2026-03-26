@@ -1,0 +1,139 @@
+WITH user_weights AS (
+  SELECT DISTINCT user_id, weight, projected_weight
+  FROM (
+    SELECT
+      user_id,
+      LAST_VALUE(projected_weight) OVER (
+        PARTITION BY user_id ORDER BY period_from
+        ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+      ) AS projected_weight,
+      LAST_VALUE(weight) OVER (
+        PARTITION BY user_id ORDER BY period_from
+        ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+      ) AS weight
+    FROM `firebird-data-project.nielseniq.weights`
+  )
+),
+
+target_users AS (
+  SELECT DISTINCT
+    w.user_id,
+    w.projected_weight,
+    b.order_date,
+    b.order_id
+  FROM user_weights w
+  JOIN (
+    SELECT DISTINCT
+      items.user_id,
+      DATE(items.order_date) AS order_date,
+      items.order_id
+    FROM `firebird-data-project.nielseniq.items_tickets_parsed` AS tickets
+    RIGHT JOIN `firebird-data-project.nielseniq.items_extended` AS items
+      ON tickets.order_id = items.order_id
+     AND tickets.item_id  = items.item_id
+      WHERE
+DATE(tickets.event_date) BETWEEN DATE '2020-01-01' AND DATE '2026-12-31' -- update event date here
+     and 
+      REGEXP_CONTAINS(event_name, r'(?i)SEARCH TERM') -- input search term here 
+    AND NOT CONTAINS_SUBSTR(event_name, 'festival') -- input search filters here
+        AND tickets.merchant_name IN (
+        'AXS','Front Gate Tickets','Live Nation','Ticketmaster',
+        'SeatGeek','See Tickets','StubHub','TickPick',
+        'TicketWeb','TodayTix','Vivid Seats'
+  )) b
+    ON w.user_id = b.user_id
+),
+
+cohort AS (
+  SELECT
+    tu.user_id,
+    tu.projected_weight,
+    d.gender_name,
+    d.household_income_name,
+    d.state_name,
+    d.zip_code,
+    CASE
+      WHEN d.mob IS NULL THEN 'other'
+      ELSE CASE
+        WHEN (EXTRACT(YEAR FROM CURRENT_DATE()) - SAFE_CAST(SUBSTR(d.mob,1,4) AS INT64)) >= 65 THEN '65+'
+        WHEN (EXTRACT(YEAR FROM CURRENT_DATE()) - SAFE_CAST(SUBSTR(d.mob,1,4) AS INT64)) BETWEEN 55 AND 64 THEN '55-64'
+        WHEN (EXTRACT(YEAR FROM CURRENT_DATE()) - SAFE_CAST(SUBSTR(d.mob,1,4) AS INT64)) BETWEEN 45 AND 54 THEN '45-54'
+        WHEN (EXTRACT(YEAR FROM CURRENT_DATE()) - SAFE_CAST(SUBSTR(d.mob,1,4) AS INT64)) BETWEEN 35 AND 44 THEN '35-44'
+        WHEN (EXTRACT(YEAR FROM CURRENT_DATE()) - SAFE_CAST(SUBSTR(d.mob,1,4) AS INT64)) BETWEEN 25 AND 34 THEN '25-34'
+        WHEN (EXTRACT(YEAR FROM CURRENT_DATE()) - SAFE_CAST(SUBSTR(d.mob,1,4) AS INT64)) BETWEEN 18 AND 24 THEN '18-24'
+        ELSE 'other'
+      END
+    END AS age_group
+  FROM target_users tu
+  JOIN `firebird-data-project.nielseniq.demographics` d
+    ON d.user_id = tu.user_id
+),
+
+cohort_clean AS (
+  SELECT *
+  FROM cohort
+  WHERE age_group <> 'other'
+),
+
+totals AS (
+  SELECT
+    COUNT(DISTINCT user_id) AS total_users,
+    SUM(projected_weight)   AS total_weight
+  FROM cohort_clean
+),
+
+br_gender AS (
+  SELECT
+    'Gender' AS metric,
+    COALESCE(gender_name, 'Unknown') AS bucket,
+    COUNT(DISTINCT user_id) AS users,
+    SUM(projected_weight)   AS weighted_users
+  FROM cohort_clean
+  GROUP BY 1, 2
+),
+
+br_income AS (
+  SELECT
+    'Income Bracket' AS metric,
+    COALESCE(household_income_name, 'Unknown') AS bucket,
+    COUNT(DISTINCT user_id) AS users,
+    SUM(projected_weight)   AS weighted_users
+  FROM cohort_clean
+  GROUP BY 1, 2
+),
+
+br_age AS (
+  SELECT
+    'Age Group' AS metric,
+    COALESCE(age_group, 'Unknown') AS bucket,
+    COUNT(DISTINCT user_id) AS users,
+    SUM(projected_weight)   AS weighted_users
+  FROM cohort_clean
+  GROUP BY 1, 2
+),
+
+br_state AS (
+  SELECT
+    'State' AS metric,
+    COALESCE(state_name, 'Unknown') AS bucket,
+    COUNT(DISTINCT user_id) AS users,
+    SUM(projected_weight)   AS weighted_users
+  FROM cohort_clean
+  GROUP BY 1, 2
+)
+
+SELECT
+  metric,
+  bucket,
+  SAFE_DIVIDE(users, t.total_users) AS pct_users,
+  SAFE_DIVIDE(weighted_users, NULLIF(t.total_weight, 0)) AS pct_weighted,
+  users,
+  weighted_users
+FROM (
+  SELECT * FROM br_gender
+  UNION ALL SELECT * FROM br_income
+  UNION ALL SELECT * FROM br_age
+  UNION ALL SELECT * FROM br_state
+) s
+CROSS JOIN totals t
+ORDER BY metric, pct_users DESC;
