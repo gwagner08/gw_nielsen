@@ -1,0 +1,35 @@
+WITH user_weights AS (
+SELECT distinct user_id, weight, projected_weight
+FROM (
+        SELECT
+          user_id
+          ,LAST_VALUE(projected_weight) OVER(partition by user_id order by period_from ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as projected_weight
+  ,LAST_VALUE(weight) OVER(partition by user_id order by period_from ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as weight
+        FROM `firebird-data-project.nielseniq.weights`)
+),
+ticket_buyers AS (
+  SELECT
+    user_id,
+    SUM(CASE WHEN EXTRACT(YEAR FROM order_date) = 2024 THEN 1 ELSE 0 END) AS tickets_2024,
+    SUM(CASE WHEN EXTRACT(YEAR FROM order_date) = 2025 THEN 1 ELSE 0 END) AS tickets_2025
+  FROM `firebird-data-project.nielseniq.items_tickets_parsed` tickets
+  JOIN `nielseniq.items_extended` items
+    ON tickets.order_id = items.order_id
+   AND tickets.item_id = items.item_id
+  WHERE event_name LIKE '%Allen Stone%'
+  GROUP BY user_id
+)
+select ticket_buyers.*, projected_weight,
+gender_name,
+CASE WHEN CAST(mob AS INT)<=((2025-65)*100+1) THEN '65+'
+ WHEN CAST(mob AS INT)<=((2025-55)*100+1) AND CAST(mob AS INT)>=((2025-64)*100+1) THEN '55-64'
+ WHEN CAST(mob AS INT)<=((2025-45)*100+1) AND CAST(mob AS INT)>=((2025-54)*100+1) THEN '45-54'
+ WHEN CAST(mob AS INT)<=((2025-35)*100+1) AND CAST(mob AS INT)>=((2025-44)*100+1) THEN '35-44'
+ WHEN CAST(mob AS INT)<=((2025-25)*100+1) AND CAST(mob AS INT)>=((2025-34)*100+1) THEN '25-34'
+ WHEN CAST(mob AS INT)<=((2025-18)*100+1) AND CAST(mob AS INT)>=((2025-24)*100+1) THEN '18-24'
+ ELSE 'other' END as age_group
+from ticket_buyers
+join user_weights
+on ticket_buyers.user_id = user_weights.user_id
+join `firebird-data-project.nielseniq.demographics` d
+on ticket_buyers.user_id = d.user_id
