@@ -1,0 +1,14 @@
+SELECT DISTINCT
+    tickets.event_name,
+    tickets.merchant_name,
+    tickets.event_date
+FROM `firebird-data-project.nielseniq.items_tickets_parsed` AS tickets
+WHERE REGEXP_CONTAINS(event_name, r'(?i)SEARCH TERM') -- enter search term here 
+and not REGEXP_CONTAINS(event_name, r'(?i)festival') -- enter terms to filter out here
+  AND tickets.merchant_name IN (
+    'AXS', 'Front Gate Tickets', 'Live Nation', 'Ticketmaster',
+    'SeatGeek', 'See Tickets', 'StubHub', 'TickPick',
+    'TicketWeb', 'TodayTix', 'Vivid Seats'
+  )
+  AND DATE(tickets.event_date) BETWEEN DATE '2020-01-01' AND DATE '2026-12-31' -- enter date range here
+ORDER BY tickets.event_date DESC
