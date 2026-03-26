@@ -1,0 +1,60 @@
+WITH user_weights AS (
+  SELECT DISTINCT user_id, weight, projected_weight
+  FROM (
+    SELECT
+      user_id,
+      LAST_VALUE(projected_weight) OVER (
+        PARTITION BY user_id
+        ORDER BY period_from
+        ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+      ) AS projected_weight,
+      LAST_VALUE(weight) OVER (
+        PARTITION BY user_id
+        ORDER BY period_from
+        ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+      ) AS weight
+    FROM `firebird-data-project.nielseniq.weights`
+  )
+),
+target_users AS (
+  SELECT DISTINCT w.user_id, w.weight, w.projected_weight
+  FROM user_weights w
+  INNER JOIN (
+    SELECT DISTINCT items.user_id
+    FROM `firebird-data-project.nielseniq.items_tickets_parsed` AS tickets
+    RIGHT JOIN `firebird-data-project.nielseniq.items_extended` AS items
+      ON tickets.order_id = items.order_id
+     AND tickets.item_id  = items.item_id
+    WHERE REGEXP_CONTAINS(tickets.event_name, r"(?i)Joe Russo's almost dead")
+      AND tickets.event_date BETWEEN DATE '2016-01-01' AND DATE '2026-01-01'
+  ) b
+  ON w.user_id = b.user_id
+)
+SELECT
+  gender_name,
+  household_income_name,
+  CASE
+    WHEN SAFE_CAST(mob AS INT64) <= ((2025 - 65) * 100) THEN '65+'
+    WHEN SAFE_CAST(mob AS INT64) <= ((2025 - 55) * 100) AND SAFE_CAST(mob AS INT64) >= ((2025 - 64) * 100) THEN '55-64'
+    WHEN SAFE_CAST(mob AS INT64) <= ((2025 - 45) * 100) AND SAFE_CAST(mob AS INT64) >= ((2025 - 54) * 100) THEN '45-54'
+    WHEN SAFE_CAST(mob AS INT64) <= ((2025 - 35) * 100) AND SAFE_CAST(mob AS INT64) >= ((2025 - 44) * 100) THEN '35-44'
+    WHEN SAFE_CAST(mob AS INT64) <= ((2025 - 25) * 100) AND SAFE_CAST(mob AS INT64) >= ((2025 - 34) * 100) THEN '25-34'
+    WHEN SAFE_CAST(mob AS INT64) <= ((2025 - 18) * 100) AND SAFE_CAST(mob AS INT64) >= ((2025 - 24) * 100) THEN '18-24'
+    ELSE 'other'
+  END AS age_group,
+  COUNT(DISTINCT target_users.user_id) AS user_count,
+  SUM(projected_weight) AS projected_user_count
+FROM target_users
+LEFT JOIN `firebird-data-project.nielseniq.demographics` AS demos
+  ON target_users.user_id = demos.user_id
+WHERE
+  CASE
+    WHEN SAFE_CAST(mob AS INT64) <= ((2025 - 65) * 100) THEN '65+'
+    WHEN SAFE_CAST(mob AS INT64) <= ((2025 - 55) * 100) AND SAFE_CAST(mob AS INT64) >= ((2025 - 64) * 100) THEN '55-64'
+    WHEN SAFE_CAST(mob AS INT64) <= ((2025 - 45) * 100) AND SAFE_CAST(mob AS INT64) >= ((2025 - 54) * 100) THEN '45-54'
+    WHEN SAFE_CAST(mob AS INT64) <= ((2025 - 35) * 100) AND SAFE_CAST(mob AS INT64) >= ((2025 - 44) * 100) THEN '35-44'
+    WHEN SAFE_CAST(mob AS INT64) <= ((2025 - 25) * 100) AND SAFE_CAST(mob AS INT64) >= ((2025 - 34) * 100) THEN '25-34'
+    WHEN SAFE_CAST(mob AS INT64) <= ((2025 - 18) * 100) AND SAFE_CAST(mob AS INT64) >= ((2025 - 24) * 100) THEN '18-24'
+    ELSE 'other'
+  END != 'other'
+GROUP BY 1,2,3;
