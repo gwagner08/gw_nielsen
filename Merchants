@@ -1,0 +1,140 @@
+WITH user_weights AS (
+  SELECT distinct user_id, weight, projected_weight
+  FROM (
+          SELECT
+            user_id
+            ,LAST_VALUE(projected_weight) OVER(partition by user_id order by period_from ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as projected_weight
+    ,LAST_VALUE(weight) OVER(partition by user_id order by period_from ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as weight
+          FROM `nielseniq.weights`)
+),
+target_users AS (
+  SELECT DISTINCT w.user_id, w.weight, w.projected_weight
+  FROM user_weights w
+  INNER JOIN (
+      SELECT DISTINCT items.user_id
+      FROM `nielseniq.items_tickets_parsed` tickets
+      RIGHT JOIN `nielseniq.items_extended` items
+        ON tickets.order_id = items.order_id AND tickets.item_id = items.item_id
+      WHERE
+DATE(tickets.event_date) BETWEEN DATE '2020-01-01' AND DATE '2026-12-31' -- update event date 
+     and 
+      REGEXP_CONTAINS(event_name, r'(?i)SEARCH TERM') -- input search term here
+    AND NOT CONTAINS_SUBSTR(event_name, 'festival') -- input search filters here
+        AND tickets.merchant_name IN (
+        'AXS','Front Gate Tickets','Live Nation','Ticketmaster',
+        'SeatGeek','See Tickets','StubHub','TickPick',
+        'TicketWeb','TodayTix','Vivid Seats'
+        )
+  ) b ON w.user_id = b.user_id
+),
+weight_totals AS (
+  SELECT
+    SUM(CASE WHEN t.user_id IS NOT NULL THEN w.projected_weight END) as target_weight_total,
+    SUM(w.projected_weight) as population_weight_total
+  FROM user_weights w
+  LEFT JOIN target_users t ON w.user_id = t.user_id
+),
+target_merchant_agg AS (
+  SELECT
+    merchant_name,
+    SUM(user_count) AS unique_users,
+    SUM(order_total*projected_weight) AS weighted_dollars,
+    SUM(projected_weight) AS weighted_counts
+  FROM
+  (SELECT bu.user_id
+    ,ie.merchant_name
+    ,COUNT(distinct ie.user_id) as user_count
+    ,MAX(projected_weight) as projected_weight
+    ,sum(item_quantity) as item_quantity
+    ,sum(item_price) as item_price
+    ,sum(CASE
+        WHEN item_price IS NOT NULL THEN item_quantity * item_price
+        ELSE order_total
+      END) as order_total
+    FROM `nielseniq.items_extended` ie
+    JOIN target_users bu ON ie.user_id = bu.user_id
+    -- FILTER 1: Merchant spend during the event for the target group
+    WHERE ie.order_date BETWEEN '2020-01-01' AND '2026-12-31' -- input order date here
+    group by 1,2) user_merchant_weights
+  GROUP BY merchant_name
+),
+all_users AS (
+  SELECT DISTINCT w.user_id, w.projected_weight
+  FROM user_weights w
+),
+all_merchant_agg AS (
+  SELECT
+    merchant_name,
+    SUM(user_count) AS unique_users,
+    SUM(order_total*projected_weight) AS weighted_dollars,
+    SUM(projected_weight) AS weighted_counts
+  FROM
+  (SELECT au.user_id
+    ,ie.merchant_name
+    ,COUNT(distinct ie.user_id) as user_count
+    ,MAX(projected_weight) as projected_weight
+    ,sum(item_quantity) as item_quantity
+    ,sum(item_price) as item_price
+    ,sum(CASE
+        WHEN item_price IS NOT NULL THEN item_quantity * item_price
+        ELSE order_total
+      END) as order_total
+    FROM `nielseniq.items_extended` ie
+    JOIN all_users au ON ie.user_id = au.user_id
+    -- FILTER 2: Merchant spend during the event for the general population
+    WHERE ie.order_date BETWEEN '2020-01-01' AND '2026-12-31' -- input order date here
+    group by 1,2) user_merchant_weights
+  GROUP BY merchant_name
+),
+merchant_category_counts AS (
+  SELECT
+    merchant_name,
+    category_name,
+    COUNT(*) AS line_items
+  FROM `nielseniq.items_extended`
+  WHERE category_name IS NOT NULL
+    AND category_name NOT IN ('(Undefined)', 'Other')
+    -- FILTER 3: Identify merchant primary category based on sales during the event
+    AND order_date BETWEEN '2020-01-01' AND '2026-12-31' -- input order date here
+  GROUP BY 1,2
+),
+
+merchant_primary_category AS (
+  SELECT
+    merchant_name,
+    category_name AS primary_category_name
+  FROM merchant_category_counts
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY merchant_name
+    ORDER BY line_items DESC, category_name
+  ) = 1
+),
+
+
+final AS (
+  SELECT
+    b.merchant_name,
+    b.unique_users AS target_users,
+    b.weighted_dollars AS target_weighted_dollars,
+    b.weighted_counts AS target_weighted_counts,
+    a.unique_users AS all_users,
+    a.weighted_dollars AS all_weighted_dollars,
+    a.weighted_counts AS all_weighted_counts,
+    ((b.weighted_counts/wt.target_weight_total)/(a.weighted_counts/wt.population_weight_total)) AS Index,
+    (b.weighted_dollars / CASE WHEN a.weighted_dollars>0 THEN a.weighted_dollars ELSE 0.01 END) AS dollars_ratio,
+    (b.weighted_counts*1.0 / a.weighted_counts) AS counts_ratio,
+    RANK() OVER(order by (b.unique_users/wt.target_weight_total)/(a.unique_users/wt.population_weight_total) desc) as merchant_rank_top,
+    RANK() OVER(order by (b.unique_users/wt.target_weight_total)/(a.unique_users/wt.population_weight_total) asc) as merchant_rank_bottom,
+m.primary_category_name
+
+  FROM target_merchant_agg b
+  JOIN all_merchant_agg a ON b.merchant_name = a.merchant_name
+  CROSS JOIN weight_totals wt
+    LEFT JOIN merchant_primary_category m
+    ON b.merchant_name = m.merchant_name
+) 
+SELECT *
+FROM final
+where index >= 1.0 
+and target_users >=5
+ORDER BY index DESC
